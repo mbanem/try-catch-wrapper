@@ -1,5 +1,7 @@
-.vscode/**
-.vscode-test/**
+.vscode
+.vscode-test
+.git
+.github
 out/**
 node_modules/**
 src/**
@@ -12,7 +14,7 @@ vsc-extension-quickstart.md
 **/*.map
 **/*.ts
 **/.vscode-test.*
-
+*.svelte
 # Exclude pnpm and workspace configs
 pnpm-lock.yaml
 pnpm-workspace.yaml
