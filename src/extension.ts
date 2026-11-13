@@ -1,24 +1,32 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 
-interface TInspectionResult {
+interface IAppState {
   handlerImplementationOK: boolean;
   globalDeclarationOK: boolean;
   handlerFilePath: string;
-  handlerSrcFilePath: string;
+  makeGlobalLog: boolean;
   handlerExported: boolean;
+  cancelApp: boolean; // could not continus user app has problem
 }
 
 let rootUri: vscode.Uri | undefined;
+let position: vscode.Position | undefined = undefined
+let logLine = ''
+let declareGlobal = ''
+const setupGlobalLog = 'Yes, Setup Global log/err'
+const varLog = 'var log: typeof console.log;'
+const varErr = 'var err: typeof console.error;'
 
-const found: TInspectionResult = {
+const initialState: IAppState = {
   handlerImplementationOK: false,
   globalDeclarationOK: false,
   handlerFilePath: '',
-  handlerSrcFilePath: '',
+  makeGlobalLog: false,
   handlerExported: false,
+  cancelApp: false,
 };
-
+let state: IAppState = initialState
 export const capitalizes = (str: string) => {
   if (!str) {
     return;
@@ -31,9 +39,9 @@ export const capitalizes = (str: string) => {
 const channel = vscode.window.createOutputChannel('TryCatchWrapper');
 const channelShow = (msg: string | string[], show: boolean = false) => {
   channel.appendLine(Array.isArray(msg) ? msg.join('\n') : msg);
-  if (show) {
-    channel.show();
-  }
+  // if (show) {
+  channel.show();
+  // }
 };
 
 async function readFileContent(uri: vscode.Uri): Promise<string | null> {
@@ -57,13 +65,15 @@ async function writeFileContent(uri: vscode.Uri, content: string): Promise<boole
 }
 
 async function setupSupportFiles(): Promise<void> {
+  channelShow(`setupSupportFiles`)
   if (!rootUri) {
-    channelShow('setupSupportFiles -- no rootUri', true);
+    channelShow('setupSupportFiles -- no rootUri');
     return;
   }
 
-  if (!found.handlerFilePath) {
+  if (!state.handlerFilePath) {
     const helpersUri = vscode.Uri.joinPath(rootUri, 'src/lib/utils/helpers.ts');
+    state.handlerFilePath = './lib/utils/helpers.ts'
     const defaultHelpersContent = `
 /*
   try/catch block sends error object and a function name, in
@@ -83,7 +93,7 @@ export const handleTryCatch = (err: unknown, info?: string) => {
     if (content) {
       const updatedContent = defaultHelpersContent + content;
       if (!await writeFileContent(helpersUri, updatedContent)) {
-        channelShow(`Failed to define handleTryCatch in ${helpersUri.fsPath}`, true);
+        channelShow(`Failed to define handleTryCatch in ${helpersUri.fsPath}`);
       }
     } else {
       await writeFileContent(helpersUri, defaultHelpersContent);
@@ -120,17 +130,17 @@ function extractFunctionName(document: vscode.TextDocument, selection: vscode.Se
   return 'anonymous context';
 }
 
+// position is acquired at the very beginning and kept as global
 function findEnclosingFunction(
-  symbols: vscode.DocumentSymbol[],
-  position: vscode.Position
+  symbols: vscode.DocumentSymbol[]
 ): vscode.DocumentSymbol | undefined {
   let candidate: vscode.DocumentSymbol | undefined;
   for (const symbol of symbols) {
-    if (!symbol.range.contains(position)) {
+    if (!symbol.range.contains(position!)) {
       continue;
     }
 
-    const nested = findEnclosingFunction(symbol.children, position);
+    const nested = findEnclosingFunction(symbol.children);
     if (nested) {
       return nested;
     }
@@ -164,13 +174,19 @@ async function getWorkspaceRootUri(): Promise<vscode.Uri | undefined> {
   return folders[0].uri;
 }
 
-// Lightweight text/structure analysis instead of full compiler API parsing
-function inspectHandlerImplementation(content: string): { found: boolean; exported: boolean } {
-  const hasHandlerDef = /(?:function\s+handleTryCatch|const\s+handleTryCatch\s*=|let\s+handleTryCatch\s*=)/.test(content);
-  const isExported = /export\s+(?:function\s+handleTryCatch|const\s+handleTryCatch)/.test(content);
+// // Lightweight text/structure analysis instead of full compiler API parsing
+// function hasHandlerImplementation(content: string): { found: boolean; exported: boolean } {
+//   const hasHandlerDef = /(?:function\s+handleTryCatch|const\s+handleTryCatch\s*=|let\s+handleTryCatch\s*=)/.test(content);
+//   const isExported = /export\s+(?:function\s+handleTryCatch|const\s+handleTryCatch)/.test(content);
+//   return { found: hasHandlerDef, exported: isExported };
+// }
+// More resilient regex supporting type annotations and spacing
+function hasHandlerImplementation(content: string): { found: boolean; exported: boolean } {
+  const hasHandlerDef = /(?:function\s+handleTryCatch|const\s+handleTryCatch\s*[:=]|let\s+handleTryCatch\s*[:=])/.test(content);
+  const isExported = /export\s+(?:function\s+handleTryCatch|const\s+handleTryCatch|const\s+\w+\s*:\s*THandleTryCatch)/.test(content) ||
+    /export\s*\{\s*handleTryCatch\s*\}/.test(content);
   return { found: hasHandlerDef, exported: isExported };
 }
-
 function inspectGlobalDeclaration(content: string): boolean {
   return content.includes('var handleTryCatch') || content.includes('handleTryCatch:');
 }
@@ -181,6 +197,8 @@ async function manageHookFiles(
   CSType: string,
   correctPath: string
 ): Promise<void> {
+
+  channelShow(`manageHookFiles ${CSType}`)
   const initTemplate = `
 //  ${CSType}-side global handleTryCatch definition
 export const init: ${CSType}Init = () => {
@@ -190,6 +208,8 @@ export const init: ${CSType}Init = () => {
   let updatedContent = content || '';
 
   const importRegex = new RegExp(`import\\s+type\\s+\\{\\s*${CSType}Init\\s*\\}\\s+from\\s+['"]@sveltejs/kit['"];?`);
+
+  // if import Client/ServerInit from @sveltejs/kit is missing prepend one
   if (!importRegex.test(updatedContent)) {
     updatedContent = `import type { ${CSType}Init } from '@sveltejs/kit';\n` + updatedContent;
   }
@@ -197,15 +217,12 @@ export const init: ${CSType}Init = () => {
   const handlerImportRegex = /import\s+\{\s*handleTryCatch\s*\}\s+from\s+['"]([^'"]+)['"];?/;
   const match = updatedContent.match(handlerImportRegex);
 
-  if (match) {
-    const currentPath = match[1];
-    if (currentPath !== correctPath) {
-      updatedContent = updatedContent.replace(
-        handlerImportRegex,
-        `import { handleTryCatch } from '${correctPath}';`
-      );
+  // if import handler has a different path update it
+  if (match) {  // match succeeded now see if paths are different
+    if (match[1] !== correctPath) {
+      updatedContent = updatedContent.replace(match[1], correctPath);
     }
-  } else {
+  } else {  // match did not succeed, so it is missing and we add a new one
     updatedContent = `import { handleTryCatch } from '${correctPath}';\n` + updatedContent;
   }
 
@@ -220,15 +237,17 @@ export const init: ${CSType}Init = () => {
 }
 
 async function setHooksFiles() {
+
   for (const cs of ['client', 'server']) {
     const uri = vscode.Uri.joinPath(rootUri as vscode.Uri, 'src', `hooks.${cs}.ts`);
     const CS = capitalizes(cs) as string;
     const content = await readFileContent(uri);
-    await manageHookFiles(uri, content, CS, found.handlerFilePath);
+    await manageHookFiles(uri, content, CS, state.handlerFilePath);
   }
 }
 
 async function redeclareHandler(content: string): Promise<string> {
+  channelShow(`redeclareHandler`)
   const cleanContent = content
     .split('\n')
     .filter(line => !/(TH|h)andleTryCatch/.test(line))
@@ -242,6 +261,7 @@ async function redeclareHandler(content: string): Promise<string> {
 }
 
 async function manageAppDTsFile(uri: vscode.Uri) {
+  channelShow(`manageAppDTsFile`)
   const content = await readFileContent(uri);
   const newDeclare = `export type THandleTryCatch = typeof handleTryCatch;
 declare global {
@@ -254,11 +274,74 @@ declare global {
   }
 }
 
-async function inspectWorkspace(root: vscode.Uri): Promise<TInspectionResult> {
+// async function inspectWorkspace(root: vscode.Uri): Promise<IAppState> {
+//   const files = await vscode.workspace.findFiles(
+//     '**/*.{ts,tsx,js,jsx}',
+//     '**/{node_modules,.svelte-kit,build,dist,coverage}/**'
+//   );
+
+//   for (const uri of files) {
+//     if (uri.fsPath.includes('/utils')) {
+//       channelShow(`utils path ${path.basename(uri.fsPath)}`)
+//     }
+//     if (!uri.fsPath.startsWith(root.fsPath)) {
+//       continue;
+//     }
+
+//     const content = await readFileContent(uri);
+//     if (!content) {
+//       continue;
+//     }
+//     if (!state.handlerImplementationOK) {
+//       const handler = hasHandlerImplementation(content);
+//       // TODO when extension is not reloaded and handleTryCatch is
+//       // moved into another file the following statement does not react
+//       // and hasHandlerImplementation could not find the handler
+//       if (handler.found && handler.exported) {
+//         channelShow(`handlerImplementationOK ${handler.found} ${handler.exported}`)
+//         const rp = path.relative(root.fsPath, uri.fsPath);
+
+//         // do not check remaining files for handler implementation
+//         state.handlerImplementationOK = true;
+//         state.handlerFilePath = rp.replace(/\s*\/?src/, '.');
+//         state.handlerExported = handler.exported;
+//         vscode.window.showInformationMessage(`handlerPath is ${state.handlerFilePath}`, { modal: true }, 'OK');
+//         if (!state.handlerExported) {
+//           vscode.window.showInformationMessage(
+//             `The handleTryCatch implementation is state at ${state.handlerFilePath} but is not exported. Please export it.`,
+//             { modal: true },
+//             'OK'
+//           );
+//           state.cancelApp = true
+//           return state
+//         }
+//       }
+//     }
+
+//     if (!state.globalDeclarationOK && uri.fsPath.endsWith('.d.ts')) {
+//       state.globalDeclarationOK = inspectGlobalDeclaration(content);
+//       await manageAppDTsFile(uri);
+//     }
+//   }
+//   // if helper is not found creaete a default as hooks file need its import
+//   if (!state.handlerFilePath) {
+//     channelShow(`handlerFilePath not fond set default?`)
+//     await setupSupportFiles();
+//   }
+//   // needs helper's path for import
+//   channelShow(`state.handlerFilePath ${state.handlerFilePath}`)
+//   await setHooksFiles();
+//   return state;
+// }
+
+async function inspectWorkspace(root: vscode.Uri): Promise<IAppState> {
   const files = await vscode.workspace.findFiles(
     '**/*.{ts,tsx,js,jsx}',
     '**/{node_modules,.svelte-kit,build,dist,coverage}/**'
   );
+
+  let foundHandlerPath = '';
+  let foundExported = false;
 
   for (const uri of files) {
     if (!uri.fsPath.startsWith(root.fsPath)) {
@@ -269,43 +352,66 @@ async function inspectWorkspace(root: vscode.Uri): Promise<TInspectionResult> {
     if (!content) {
       continue;
     }
-    if (!found.handlerImplementationOK) {
-      const handler = inspectHandlerImplementation(content);
-      if (handler.found && handler.exported) {
-        const rp = path.relative(root.fsPath, uri.fsPath);
-        found.handlerImplementationOK = true;
-        found.handlerSrcFilePath = rp;
-        found.handlerFilePath = rp.replace(/\s*\/?src/, '.');
-        found.handlerExported = handler.exported;
-        vscode.window.showInformationMessage(`handlerPath is ${found.handlerFilePath}`, { modal: true }, 'OK');
-        if (!found.handlerExported) {
-          vscode.window.showInformationMessage(
-            `The handleTryCatch implementation is found at ${found.handlerSrcFilePath} but is not exported. Please export it.`,
-            { modal: true },
-            'OK'
-          );
-        }
-        await setHooksFiles();
-      }
-    }
 
-    if (!found.globalDeclarationOK && uri.fsPath.endsWith('.d.ts')) {
-      found.globalDeclarationOK = inspectGlobalDeclaration(content);
+    // Check for global declaration in .d.ts files
+    if (!state.globalDeclarationOK && uri.fsPath.endsWith('.d.ts')) {
+      state.globalDeclarationOK = inspectGlobalDeclaration(content);
       await manageAppDTsFile(uri);
     }
-  }
-  return found;
-}
 
+    // Scan for handler implementation across files
+    const handler = hasHandlerImplementation(content);
+    if (handler.found) {
+      const rp = path.relative(root.fsPath, uri.fsPath);
+      const relativePath = rp.replace(/\s*\/?src/, '.');
+
+      channelShow(`Found handleTryCatch in: ${relativePath} (Exported: ${handler.exported})`);
+
+      if (handler.exported) {
+        foundHandlerPath = relativePath;
+        foundExported = true;
+        // Found a valid exported handler! We can stop searching.
+        break;
+      } else if (!foundHandlerPath) {
+        // Fallback: remember unexported one just in case no exported one is found yet
+        foundHandlerPath = relativePath;
+        foundExported = false;
+      }
+    }
+  }
+
+  if (foundHandlerPath) {
+    state.handlerImplementationOK = true;
+    state.handlerFilePath = foundHandlerPath;
+    state.handlerExported = foundExported;
+
+    if (!state.handlerExported) {
+      vscode.window.showInformationMessage(
+        `The handleTryCatch implementation is at ${state.handlerFilePath} but is not exported. Please export it.`,
+        { modal: true },
+        'OK'
+      );
+      state.cancelApp = true;
+      return state;
+    }
+  } else {
+    // If helper is not found anywhere, set up default
+    channelShow(`handlerFilePath not found, setting up default...`);
+    await setupSupportFiles();
+  }
+
+  channelShow(`state.handlerFilePath ${state.handlerFilePath}`);
+  await setHooksFiles();
+  return state;
+}
 async function wrapSelectedBlock(editor: vscode.TextEditor): Promise<void> {
-  const position = editor.selection.active;
 
   const symbols = await vscode.commands.executeCommand<vscode.DocumentSymbol[] | undefined>(
     'vscode.executeDocumentSymbolProvider',
     editor.document.uri
   );
 
-  const enclosingSymbol = findEnclosingFunction(symbols ?? [], position);
+  const enclosingSymbol = findEnclosingFunction(symbols ?? []);
   let funcName = enclosingSymbol ? enclosingSymbol.name : '';
 
   if (!funcName) {
@@ -340,7 +446,28 @@ async function wrapSelectedBlock(editor: vscode.TextEditor): Promise<void> {
   await editor.insertSnippet(snippet, editor.selection);
 }
 
+
+
+
+
+async function varGlobalsFouund(rootUri: vscode.Uri): Promise<vscode.Uri | boolean> {
+  for (const p of ['src/app.d.ts', 'src/global.d.ts', 'srx/routes/+layout.svelte']) {
+    const varsPath = vscode.Uri.joinPath(rootUri, p)
+    if (await readFileContent(varsPath)) {
+      channelShow(`varGlobalsFouund `)
+      return varsPath
+    }
+  }
+  channelShow(`varGlobalsFouund false`)
+  return false
+}
+
 async function wrapTryCatch(): Promise<void> {
+  // if user launch extension many times in the same app
+  // the extension hold the previous state like state.handlerFilePath
+  // so such states should be initialized here every time
+  Object.assign(state, initialState)
+  channelShow(`state ${state}`)
   const editor = vscode.window.activeTextEditor;
   let validationMessage = '';
 
@@ -357,6 +484,10 @@ async function wrapTryCatch(): Promise<void> {
     return;
   }
 
+  // @ts-expect-error though above is test if (!editor) { with return before this statement
+  // take position early as cursor could move before searching for enclosing function
+  position = editor.selection.active as vscode.Position;
+
   rootUri = await getWorkspaceRootUri();
   if (!rootUri) {
     channelShow(
@@ -366,8 +497,38 @@ async function wrapTryCatch(): Promise<void> {
     return;
   }
 
-  await setupSupportFiles();
+  // is there any app.d.ts, global.d.ts or /routes/+layout.svelte
+  // where declare global { exists to held var handleTryCatch, log and err
+  const varsPath = await varGlobalsFouund(rootUri)
+  if (!varsPath) {
+    channelShow(`no  varsPath`)
+    // this question must be asked somewhere so ask here
+    const answer = await vscode.window.showInformationMessage(
+      'Should setup global log/err (console.log/error) for this project?',
+      { modal: true },
+      setupGlobalLog,
+    )// based on the answer prepare globals for log and err or left an empty string
+    logLine = (answer !== setupGlobalLog) ? '' :
+      `var log: typeof console.log
+  var err: typeof console.error;`
+    declareGlobal = `export type THandleTryCatch = typeof handleTryCatch
+declare global {
+  ${logLine}
+  var handleTryCatch: THandleTryCatch
+`;
+
+    const appdtsUri = vscode.Uri.joinPath(rootUri, 'src', 'app.d.ts')
+    state.makeGlobalLog = false;  // it is just done
+    // NOTE declareGlobal has no closing curly bracket
+    channelShow(`writeFileContent ${appdtsUri}`)
+    await writeFileContent(appdtsUri, declareGlobal + '}')
+  }
+
+
+
+  // search for export const/func handleTryCatch implementatioin
   await inspectWorkspace(rootUri);
+
   await wrapSelectedBlock(editor as vscode.TextEditor);
 }
 
